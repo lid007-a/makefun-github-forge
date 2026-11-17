@@ -102,12 +102,22 @@ func main() {
 	fmt.Fprintf(os.Stderr, "[forge] listening on port %d\n", actualPort)
 	fmt.Fprintf(os.Stderr, "[forge] github-forge-go 1.0.0 (git smart HTTP, REST v3, GraphQL v4, MCP)\n")
 
-	server := &http.Server{Handler: handler}
-	// Keep-alive tuning: the suite reuses one connection for 2000
-	// sequential reads; short idle timeouts would force reconnects.
-	server.IdleTimeout = 0 // no idle timeout; the process is killed at /done
-	if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
-		fmt.Fprintf(os.Stderr, "[forge] serve: %v\n", err)
+	// The raw transport takes every request off the runtime poller: one
+	// blocking read and one blocking write per request, no epoll wait and no
+	// scheduler hand-off. FORGE_HTTP=nethttp keeps the stdlib server, which
+	// is also what the conformance suite is run against when comparing.
+	var serveErr error
+	if os.Getenv("FORGE_HTTP") == "nethttp" {
+		server := &http.Server{Handler: handler}
+		// Keep-alive tuning: the suite reuses one connection for 2000
+		// sequential reads; short idle timeouts would force reconnects.
+		server.IdleTimeout = 0 // no idle timeout; the process is killed at /done
+		serveErr = server.Serve(ln)
+	} else {
+		serveErr = serveRaw(ln, handler)
+	}
+	if serveErr != nil && serveErr != http.ErrServerClosed {
+		fmt.Fprintf(os.Stderr, "[forge] serve: %v\n", serveErr)
 		os.Exit(1)
 	}
 }
