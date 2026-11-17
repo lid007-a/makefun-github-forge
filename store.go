@@ -37,18 +37,20 @@ const (
 	FixedEpoch = 1700000000
 )
 
+// trialNow is MAKEFUN_TRIAL_NOW, read once: the env never changes during a
+// run, and os.Getenv takes a lock on every call.
+var trialNow = os.Getenv("MAKEFUN_TRIAL_NOW")
+
 func nowIso() string {
-	t := os.Getenv("MAKEFUN_TRIAL_NOW")
-	if t != "" {
-		return t
+	if trialNow != "" {
+		return trialNow
 	}
 	return FixedNow
 }
 
 func nowEpoch() int64 {
-	t := os.Getenv("MAKEFUN_TRIAL_NOW")
-	if t != "" {
-		if tm, err := time.Parse(time.RFC3339, t); err == nil {
+	if trialNow != "" {
+		if tm, err := time.Parse(time.RFC3339, trialNow); err == nil {
 			return tm.Unix()
 		}
 	}
@@ -302,6 +304,12 @@ type Comment struct {
 }
 
 type Issue struct {
+	// cacheBody is this issue's marshaled JSON as last built, and cacheMut
+	// the Store.mut it was built at: any mutating request bumps Store.mut
+	// and so invalidates every cached body. The read workload is 2,000
+	// GETs of one issue, so this turns each of them into a map lookup.
+	cacheBody []byte
+	cacheMut  uint64
 	Number    int
 	Title     string
 	Body      string
@@ -317,21 +325,21 @@ type Issue struct {
 }
 
 type PullRequest struct {
-	Number        int
-	Title         string
-	Body          string
-	State         string // "open" | "closed"
-	Merged        bool
-	MergedAt      string // "" means null
+	Number         int
+	Title          string
+	Body           string
+	State          string // "open" | "closed"
+	Merged         bool
+	MergedAt       string // "" means null
 	MergeCommitSha string // "" means null
-	HeadRef       string
-	HeadSha       string
-	BaseRef       string
-	BaseSha       string
-	CreatedAt     string
-	UpdatedAt     string
-	Seq           int
-	Comments      []*Comment
+	HeadRef        string
+	HeadSha        string
+	BaseRef        string
+	BaseSha        string
+	CreatedAt      string
+	UpdatedAt      string
+	Seq            int
+	Comments       []*Comment
 }
 
 type fetchCacheEntry struct {
@@ -351,7 +359,7 @@ type Repo struct {
 	// git object store: sha -> object
 	Objects map[string]*GitObject
 	// ref name -> commit/tag sha (refs/heads/* and refs/tags/*)
-	Refs map[string]string
+	Refs   map[string]string
 	Labels map[string]*Label
 	Issues []*Issue
 	Pulls  []*PullRequest
@@ -377,6 +385,9 @@ type Store struct {
 	repos      map[string]*Repo
 	nextRepoID int
 	requestSeq int64
+	// mut counts mutating REST requests. A cached read body records the mut
+	// it was built at, so any write invalidates it without tracking fields.
+	mut uint64
 }
 
 func NewStore() *Store {

@@ -15,6 +15,7 @@ package main
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/zlib"
 	"crypto/sha1"
 	"encoding/binary"
@@ -23,6 +24,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 )
 
 const ZeroOID = "0000000000000000000000000000000000000000"
@@ -35,15 +37,19 @@ const receiveV0Caps = "report-status side-band-64k delete-refs ofs-delta agent=f
 // pkt-line
 // ---------------------------------------------------------------------------
 
+const hexDigits = "0123456789abcdef"
+
 func pktLine(payload []byte) []byte {
 	l := len(payload) + 4
 	if l > 65520 {
 		panic("pkt-line too long")
 	}
-	head := []byte(fmt.Sprintf("%04x", l))
-	out := make([]byte, 0, l)
-	out = append(out, head...)
-	out = append(out, payload...)
+	out := make([]byte, l)
+	out[0] = hexDigits[(l>>12)&0xf]
+	out[1] = hexDigits[(l>>8)&0xf]
+	out[2] = hexDigits[(l>>4)&0xf]
+	out[3] = hexDigits[l&0xf]
+	copy(out[4:], payload)
 	return out
 }
 
@@ -342,80 +348,51 @@ func readPack(buf []byte, resolveBase func(sha string) *GitObject) ([]packEntry,
 	return entries, nil
 }
 
-// adler32 computes Adler-32 (RFC 1950) of the uncompressed data. A zlib
-// stream stores it as its last 4 bytes (big-endian), right after the
-// deflate data.
-func adler32(data []byte) uint32 {
-	const mod = 65521
-	a := uint32(1)
-	b := uint32(0)
-	i := 0
-	for i < len(data) {
-		end := i + 5552
-		if end > len(data) {
-			end = len(data)
-		}
-		for ; i < end; i++ {
-			a += uint32(data[i])
-			b += a
-		}
-		a %= mod
-		b %= mod
-	}
-	return (b << 16) | a
+// flateReaderPool reuses flate decompressors. Each one owns a 32 KiB
+// history window, and one push carries three objects, so pooling keeps the
+// unpack path from allocating a window per object.
+var flateReaderPool sync.Pool
+
+type flateResetter interface {
+	io.ReadCloser
+	Reset(r io.Reader, dict []byte) error
 }
 
-// inflateEntry inflates one zlib stream starting at off and reports the
-// offset just past its end. One inflate yields the data, whose Adler-32 is
-// the stream's last 4 bytes — scan for those bytes (they are the first
-// occurrence after the 2-byte header, verified by re-inflating the
-// candidate prefix), for 2 inflates per object total.
+func getFlateReader(r io.Reader) flateResetter {
+	if v := flateReaderPool.Get(); v != nil {
+		fr := v.(flateResetter)
+		if err := fr.Reset(r, nil); err == nil {
+			return fr
+		}
+	}
+	return flate.NewReader(r).(flateResetter)
+}
+
+// inflateEntry inflates one zlib stream starting at off and returns the
+// offset just past it. The deflate payload goes to a pooled flate reader
+// over a bytes.Reader: a bytes.Reader is a flate.Reader, so the inflater
+// consumes exactly the deflate stream and never reads ahead, and the bytes
+// it left are the stream's 4-byte Adler-32 trailer. One inflate per object.
 func inflateEntry(buf []byte, off int) ([]byte, int, error) {
-	r, err := zlib.NewReader(bytes.NewReader(buf[off:]))
+	if off+2 > len(buf) {
+		return nil, 0, fmt.Errorf("truncated zlib header")
+	}
+	if hdr := uint16(buf[off])<<8 | uint16(buf[off+1]); hdr%31 != 0 || buf[off]&0x0f != 8 || buf[off+1]&0x20 != 0 {
+		return nil, 0, fmt.Errorf("bad zlib header")
+	}
+	br := bytes.NewReader(buf[off+2:])
+	fr := getFlateReader(br)
+	data, err := io.ReadAll(fr)
+	fr.Close()
+	flateReaderPool.Put(fr)
 	if err != nil {
 		return nil, 0, err
 	}
-	data, err := io.ReadAll(r)
-	r.Close()
-	if err != nil {
-		return nil, 0, err
+	next := off + 2 + (len(buf) - off - 2 - br.Len()) + 4
+	if next > len(buf) {
+		return nil, 0, fmt.Errorf("truncated zlib trailer")
 	}
-	adler := adler32(data)
-	needle := make([]byte, 4)
-	binary.BigEndian.PutUint32(needle, adler)
-	// The deflate stream is at most the uncompressed size plus stored-block
-	// overhead; bound the scan generously so a large incompressible object
-	// still fits.
-	maxEnd := len(buf) - 4
-	if bound := off + len(data) + (len(data) >> 9) + 128; bound < maxEnd {
-		maxEnd = bound
-	}
-	idx := off + 2
-	for idx <= maxEnd {
-		rel := bytes.Index(buf[idx:maxEnd+1], needle)
-		if rel < 0 {
-			break
-		}
-		found := idx + rel
-		if found > maxEnd {
-			break
-		}
-		// Verify: the candidate prefix must inflate to exactly this data.
-		if check, err := inflateAll(buf[off : found+4]); err == nil && bytes.Equal(check, data) {
-			return data, found + 4, nil
-		}
-		idx = found + 1
-	}
-	return nil, 0, fmt.Errorf("zlib stream end not found")
-}
-
-func inflateAll(buf []byte) ([]byte, error) {
-	r, err := zlib.NewReader(bytes.NewReader(buf))
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-	return io.ReadAll(r)
+	return data, next, nil
 }
 
 func deflate(data []byte) []byte {
@@ -587,8 +564,8 @@ func reachableObjects(repo *Repo, tips []string, stopAt map[string]bool) map[str
 }
 
 type collectOpts struct {
-	depth        *int
-	haves        []string
+	depth         *int
+	haves         []string
 	clientShallow []string
 }
 

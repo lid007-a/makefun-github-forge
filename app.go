@@ -23,7 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -47,6 +47,9 @@ func isAuthorized(r *http.Request) bool {
 // marshalJSON renders a value as JSON the way the Node port does:
 // no HTML escaping of <, >, & (encoding/json escapes them by default).
 func marshalJSON(v any) []byte {
+	if r, ok := v.(rawJSON); ok {
+		return r
+	}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
@@ -79,7 +82,34 @@ type bodyTooLargeError struct{}
 
 func (e *bodyTooLargeError) Error() string { return "request body too large" }
 
-var gitRouteRe = regexp.MustCompile(`^/([^/]+)/([^/]+)\.git/(.+)$`)
+// parseGitRoute splits /{owner}/{repo}.git/{action} without a regexp: every
+// request pays for this test, and most of them are not git routes.
+func parseGitRoute(path string) (owner, repo, action string, ok bool) {
+	if len(path) < 8 || path[0] != '/' {
+		return
+	}
+	rest := path[1:]
+	i := strings.IndexByte(rest, '/')
+	if i <= 0 {
+		return
+	}
+	owner = rest[:i]
+	rest = rest[i+1:]
+	j := strings.IndexByte(rest, '/')
+	if j <= 0 {
+		return
+	}
+	mid := rest[:j]
+	if !strings.HasSuffix(mid, ".git") || len(mid) == 4 {
+		return
+	}
+	repo = mid[:len(mid)-4]
+	action = rest[j+1:]
+	if action == "" {
+		return
+	}
+	return owner, repo, action, true
+}
 
 func writeJSON(w http.ResponseWriter, status int, body any, requestID string, extra map[string]string) {
 	var payload []byte
@@ -92,32 +122,65 @@ func writeJSON(w http.ResponseWriter, status int, body any, requestID string, ex
 	for k, v := range extra {
 		h.Set(k, v)
 	}
+	// An explicit length keeps the reply out of chunked framing, so the
+	// header block and a small body leave in one write.
+	h.Set("Content-Length", strconv.Itoa(len(payload)))
 	w.WriteHeader(status)
-	w.Write(payload)
+	if len(payload) > 0 {
+		w.Write(payload)
+	}
 }
 
 func writeBuffer(w http.ResponseWriter, status int, contentType string, body []byte, requestID string) {
 	h := w.Header()
 	h.Set("Content-Type", contentType)
 	h.Set("X-Github-Request-Id", requestID)
+	h.Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(status)
-	w.Write(body)
+	if len(body) > 0 {
+		w.Write(body)
+	}
 }
 
 func writeText(w http.ResponseWriter, status int, body, requestID string) {
 	h := w.Header()
 	h.Set("Content-Type", "text/plain")
 	h.Set("X-Github-Request-Id", requestID)
+	h.Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(status)
 	w.Write([]byte(body))
+}
+
+// unescPath decodes %XX in a path segment, and does nothing (no allocation,
+// no parse) when the segment holds none — the usual case.
+func unescPath(s string) string {
+	if strings.IndexByte(s, '%') < 0 {
+		return s
+	}
+	if u, err := url.PathUnescape(s); err == nil {
+		return u
+	}
+	return s
 }
 
 // makeHandler returns the HTTP handler for the forge. Every request gets a
 // request id; a panic in a handler is caught and answered 400, never
 // crashing the process.
 func makeHandler(store *Store) http.Handler {
+	// closeAfter, when set, answers every request with Connection: close.
+	// A pooled keep-alive socket costs the client a fixed delay per request
+	// on some stacks; a fresh connection costs a handshake. Which is cheaper
+	// is measured, not assumed.
+	closeAfter := os.Getenv("FORGE_CLOSE") != ""
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestID := store.requestID()
+		// No Date header: net/http would read the clock per response for it,
+		// and in a sandbox without a vDSO that is a syscall on every reply.
+		// The wire contract asks for none.
+		w.Header()["Date"] = nil
+		if closeAfter {
+			w.Header().Set("Connection", "close")
+		}
 		defer func() {
 			if rec := recover(); rec != nil {
 				// Never crash the process on a bad request; answer 400 and stay up.
@@ -155,10 +218,9 @@ func makeHandler(store *Store) http.Handler {
 		}
 
 		// ---- git smart HTTP ----
-		if m := gitRouteRe.FindStringSubmatch(path); m != nil {
-			owner, _ := url.PathUnescape(m[1])
-			repoName, _ := url.PathUnescape(m[2])
-			action := m[3]
+		if rawOwner, rawRepo, action, isGit := parseGitRoute(path); isGit {
+			owner := unescPath(rawOwner)
+			repoName := unescPath(rawRepo)
 			var repo *Repo
 			if owner == ViewerLogin {
 				store.mu.RLock()

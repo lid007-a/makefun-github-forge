@@ -495,9 +495,9 @@ func diffTrees(repo *Repo, baseTree, headTree string) []fileChange {
 }
 
 type squashResult struct {
-	sha       string
-	message   string
-	conflict  bool
+	sha      string
+	message  string
+	conflict bool
 }
 
 // squashMerge squash-merges a pull request onto its base branch.
@@ -618,8 +618,24 @@ func unesc(s string) string {
 // is cheap.
 func handleRest(store *Store, method, path string, query url.Values, rawBody []byte, baseURL string) restResult {
 	store.mu.Lock()
+	// Any request that can change state bumps mut, which invalidates every
+	// cached read body; GET leaves them warm.
+	if method != "GET" {
+		store.mut++
+	}
 	defer store.mu.Unlock()
 	return handleRestLocked(store, method, path, query, rawBody, baseURL)
+}
+
+// rawJSON is a response body that is already marshaled: writeJSON sends it
+// as is instead of encoding it again.
+type rawJSON []byte
+
+// issueCreateBody is the subset of a create-issue body the handler reads.
+type issueCreateBody struct {
+	Title  string            `json:"title"`
+	Body   *string           `json:"body"`
+	Labels []json.RawMessage `json:"labels"`
 }
 
 func handleRestLocked(store *Store, method, path string, query url.Values, rawBody []byte, baseURL string) restResult {
@@ -1086,28 +1102,36 @@ func handleRepoSub(store *Store, repo *Repo, tail []string, method string, query
 				return restOK(200, out, headers)
 			}
 			if method == "POST" {
-				body, malformed := parseBody(rawBody)
-				if malformed || body == nil {
+				// Decode straight into the three fields the create reads: a
+				// map[string]any parse allocates a value per key, and this is
+				// the write workload's every request.
+				var in issueCreateBody
+				if len(rawBody) == 0 {
 					return restErr(400, "Problems parsing JSON")
 				}
-				title, _ := strVal(body["title"])
+				if err := json.Unmarshal(rawBody, &in); err != nil {
+					return restErr(400, "Problems parsing JSON")
+				}
+				title := in.Title
 				if title == "" {
 					return restErr(422, "title is required")
 				}
-				var labelNames []string
-				if arr, ok := body["labels"].([]any); ok {
-					for _, l := range arr {
-						if s, ok := l.(string); ok {
-							labelNames = append(labelNames, s)
-						} else if m, ok := l.(map[string]any); ok {
-							if n, ok := strVal(m["name"]); ok {
-								labelNames = append(labelNames, n)
-							}
-						}
-					}
-				}
 				var labels []*Label
-				for _, n := range labelNames {
+				for _, raw := range in.Labels {
+					var n string
+					if len(raw) > 0 && raw[0] == '"' {
+						if err := json.Unmarshal(raw, &n); err != nil {
+							continue
+						}
+					} else {
+						var ref struct {
+							Name string `json:"name"`
+						}
+						if err := json.Unmarshal(raw, &ref); err != nil {
+							continue
+						}
+						n = ref.Name
+					}
 					l, ok := repo.Labels[n]
 					if !ok {
 						return restErr(422, "Label '"+n+"' does not exist")
@@ -1115,7 +1139,10 @@ func handleRepoSub(store *Store, repo *Repo, tail []string, method string, query
 					labels = append(labels, l)
 				}
 				now := nowIso()
-				issueBody, _ := strVal(body["body"])
+				issueBody := ""
+				if in.Body != nil {
+					issueBody = *in.Body
+				}
 				issue := &Issue{
 					Number:    repo.NextNumber,
 					Title:     title,
@@ -1153,7 +1180,13 @@ func handleRepoSub(store *Store, repo *Repo, tail []string, method string, query
 		}
 		if len(rest) == 1 {
 			if method == "GET" {
-				return restOK(200, makeIssueJSON(repo, issue), nil)
+				if issue.cacheBody != nil && issue.cacheMut == store.mut {
+					return restResult{status: 200, body: rawJSON(issue.cacheBody)}
+				}
+				out := marshalJSON(makeIssueJSON(repo, issue))
+				issue.cacheBody = out
+				issue.cacheMut = store.mut
+				return restResult{status: 200, body: rawJSON(out)}
 			}
 			if method == "PATCH" {
 				body, malformed := parseBody(rawBody)
