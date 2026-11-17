@@ -57,6 +57,12 @@ export function storeObject(objects: Map<string, GitObject>, type: ObjType, data
   return sha;
 }
 
+/** Store an object whose SHA-1 is already known (e.g. computed by readPack),
+ *  skipping the redundant re-hash. Identical result to storeObject. */
+export function storeObjectSha(objects: Map<string, GitObject>, sha: string, type: ObjType, data: Buffer): void {
+  if (!objects.has(sha)) objects.set(sha, { type, data });
+}
+
 export interface TreeEntry {
   mode: string; // "100644" | "100755" | "120000" | "40000"
   name: string;
@@ -212,6 +218,11 @@ export interface Repo {
   /** one shared counter: issues and PRs draw numbers from the same sequence */
   nextNumber: number;
   seq: number; // creation-order counter for issues/PRs/comments
+  /** Cache of upload-pack fetch responses, keyed by the fetch args.
+   *  Each entry records the object-store size it was built at; objects are
+   *  append-only and content-addressed, so a matching size means the
+   *  reachable closure (and hence the response bytes) is unchanged. */
+  fetchCache: Map<string, { size: number; body: Buffer }>;
 }
 
 export class Store {
@@ -250,6 +261,7 @@ export class Store {
       pulls: [],
       nextNumber: 1,
       seq: 0,
+      fetchCache: new Map(),
     };
     this.repos.set(this.key(owner, name), repo);
     return repo;

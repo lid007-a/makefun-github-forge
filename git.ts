@@ -18,7 +18,7 @@ import {
   parseTag,
   parseTree,
   sha1Of,
-  storeObject,
+  storeObjectSha,
   type GitObject,
   type ObjType,
   type Repo,
@@ -238,24 +238,60 @@ export function readPack(
   return entries;
 }
 
+// Adler-32 (RFC 1950) of the uncompressed data. A zlib stream stores it as
+// its last 4 bytes (big-endian), right after the deflate data.
+function adler32(data: Buffer): number {
+  const MOD = 65521;
+  let a = 1;
+  let b = 0;
+  // Defer the modulo: a and b stay below 2^31 for blocks of <= 5552 bytes.
+  let i = 0;
+  while (i < data.length) {
+    const end = Math.min(i + 5552, data.length);
+    for (; i < end; i++) {
+      a += data[i]!;
+      b += a;
+    }
+    a %= MOD;
+    b %= MOD;
+  }
+  return (((b << 16) | a) >>> 0);
+}
+
 // Inflate one zlib stream starting at off and report the offset just past
-// its end. inflateSync ignores trailing bytes but throws on truncation, so
-// the predicate "this prefix inflates cleanly" is monotonic in length and
-// the stream end is found by binary search.
+// its end. The old implementation binary-searched the end with ~log2(n)
+// trial inflates per object; each inflateSync costs ~40us of stream setup,
+// so a 3-object push paid ~30 of them. Now: one inflate yields the data,
+// whose Adler-32 is the stream's last 4 bytes — scan for those bytes (they
+// are the first occurrence after the 2-byte header, verified by re-inflating
+// the candidate prefix), for 2 inflates per object total.
 function inflateEntry(buf: Buffer, off: number): { data: Buffer; next: number } {
   const data = inflateSync(buf.subarray(off));
-  let lo = 1;
-  let hi = buf.length - off;
-  while (lo < hi) {
-    const mid = Math.floor((lo + hi) / 2);
+  const adler = adler32(data);
+  const needle = Buffer.alloc(4);
+  needle.writeUInt32BE(adler, 0);
+  // The deflate stream is at most the uncompressed size plus stored-block
+  // overhead (zlib's deflateBound is ~len + len/4096 + 64); bound the scan
+  // generously so a large incompressible object still fits.
+  const maxEnd = Math.min(
+    buf.length - 4,
+    off + data.length + (data.length >> 9) + 128,
+  );
+  let idx = off + 2;
+  while (idx <= maxEnd) {
+    const found = buf.indexOf(needle, idx);
+    if (found < 0 || found > maxEnd) break;
+    // Verify: the candidate prefix must inflate to exactly this data.
+    // (A coincidental Adler match inside the deflate bytes fails here.)
     try {
-      inflateSync(buf.subarray(off, off + mid));
-      hi = mid;
+      const check = inflateSync(buf.subarray(off, found + 4));
+      if (check.equals(data)) return { data, next: found + 4 };
     } catch {
-      lo = mid + 1;
+      // Not the stream end; keep scanning past this match.
     }
+    idx = found + 1;
   }
-  return { data, next: off + lo };
+  throw new Error("zlib stream end not found");
 }
 
 // ---------------------------------------------------------------------------
@@ -623,6 +659,25 @@ export function handleUploadPack(
 ): { status: number; contentType: string; body: Buffer } {
   try {
     const args = version2 ? parseFetchArgsV2(body) : parseFetchArgsV0(body);
+    // Repeated identical fetches (the clone workload fires 50 concurrent
+    // depth-1 clones of the same tip) produce byte-identical responses:
+    // objects are content-addressed and immutable, so the pack for a given
+    // (wants, haves, shallow, depth, filter) is fixed. Cache the whole
+    // response; the object-store size is the generation guard.
+    const cacheKey = JSON.stringify([
+      version2 ? 2 : 0,
+      args.wants,
+      args.haves,
+      args.shallow,
+      args.depth ?? null,
+      args.filter ?? null,
+      args.done,
+    ]);
+    const cached = repo.fetchCache.get(cacheKey);
+    if (cached && cached.size === repo.objects.size) {
+      return { status: 200, contentType: "application/x-git-upload-pack-result", body: cached.body };
+    }
+    let out: Buffer;
     if (args.wants.length === 0) {
       // No wants: answer an empty pack so the client still sees a packfile.
       // (No acknowledgments section: a fetch with no wants carries `done`.)
@@ -633,9 +688,17 @@ export function handleUploadPack(
             pktFlush(),
           ]
         : [pktLine("NAK\n"), ...sidebandPackets(emptyPack(), 1), pktFlush()];
-      return { status: 200, contentType: "application/x-git-upload-pack-result", body: Buffer.concat(parts) };
+      out = Buffer.concat(parts);
+    } else {
+      out = version2 ? buildFetchResponseV2(repo, args) : buildFetchResponseV0(repo, args);
     }
-    const out = version2 ? buildFetchResponseV2(repo, args) : buildFetchResponseV0(repo, args);
+    // Bound the cache (FIFO by insertion order) so a repo with many distinct
+    // fetches does not grow it without limit.
+    if (repo.fetchCache.size >= 32) {
+      const oldest = repo.fetchCache.keys().next().value;
+      if (oldest !== undefined) repo.fetchCache.delete(oldest);
+    }
+    repo.fetchCache.set(cacheKey, { size: repo.objects.size, body: out });
     return { status: 200, contentType: "application/x-git-upload-pack-result", body: out };
   } catch {
     return { status: 400, contentType: "application/x-git-upload-pack-result", body: Buffer.alloc(0) };
@@ -752,7 +815,7 @@ export function handleReceivePack(
     if (hasPack && rest.length > 0) {
       try {
         const entries = readPack(rest, (sha) => repo.objects.get(sha));
-        for (const e of entries) storeObject(repo.objects, e.type, e.data);
+        for (const e of entries) storeObjectSha(repo.objects, e.sha, e.type, e.data);
       } catch (err) {
         return fail(`unpack error: ${(err as Error).message}`);
       }
